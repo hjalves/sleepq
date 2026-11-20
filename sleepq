@@ -1,0 +1,642 @@
+#!/usr/bin/env python3
+"""sleepq: wake up periodically, run queued tasks, go back to sleep.
+
+The queue is a directory (normally a git clone) with this layout:
+
+    queue/     pending tasks, one bash script per file, run in name order
+    results/   one folder per finished task: the script, output.log, result.json
+    HOLD       if present, the machine stays awake (remote "don't sleep" switch)
+
+Optional headers inside a task script:
+
+    # sleepq: not-before=2026-11-21T14:20     (local time unless an offset is given)
+    # sleepq: timeout=2h
+
+Subcommands: setup, daemon, arm, status, submit, hold, release.
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import pwd
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+DEFAULT_CONFIG = os.environ.get("SLEEPQ_CONFIG", "/etc/sleepq/config.toml")
+
+DEFAULTS = {
+    "queue_dir": "/var/lib/sleepq/repo",   # git clone (or plain dir) holding queue/ and results/
+    "state_dir": "/var/lib/sleepq/state",  # local-only state: logs, attempt counters, work dirs
+    "git": True,                           # pull before / push after; False = plain directory
+    "git_remote": "origin",
+    "git_branch": "main",
+    "git_ssh_command": "",                 # e.g. "ssh -i /home/me/.ssh/sleepq_deploy -o IdentitiesOnly=yes"
+    "run_as": "",                          # user that runs tasks and git; empty = the daemon's own user
+    "wake_interval": "1h",                 # how long to sleep when there is nothing to do
+    "grace_period": "3m",                  # stay up this long after the last task (time to SSH in)
+    "awake_poll": "5m",                    # re-check interval while something keeps the machine awake
+    "network_timeout": "90s",              # how long to wait for the network after resume
+    "task_timeout": "6h",                  # default per-task limit (header can override)
+    "max_attempts": 2,                     # a task interrupted this many times (crash/power loss) is failed
+    "max_log_bytes": 1_000_000,            # output tail copied into the repo; full log stays in state_dir
+    "block_on_sessions": "active",         # "active": non-idle local or any SSH session blocks suspend
+                                           # "any": any login session blocks; "none": ignore sessions
+    "dry_run": False,                      # log instead of setting the RTC alarm / suspending
+}
+
+HEADER_RE = re.compile(r"^#\s*sleepq:\s*([\w-]+)\s*=\s*(.+?)\s*$")
+DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([smhd]?)")
+UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def parse_duration(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().lower()
+    pos, total = 0, 0.0
+    for m in DURATION_RE.finditer(text):
+        if text[pos:m.start()].strip():
+            break
+        total += float(m.group(1)) * UNITS[m.group(2)]
+        pos = m.end()
+    if pos == 0 or text[pos:].strip():
+        raise ValueError(f"bad duration: {value!r} (use e.g. 90s, 5m, 1h30m)")
+    return total
+
+
+def fmt_duration(seconds):
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return (f"{h}h" if h else "") + (f"{m}m" if m else "") + (f"{s}s" if s or not (h or m) else "")
+
+
+def now():
+    return dt.datetime.now().astimezone()
+
+
+def sleep_offset():
+    """Seconds the machine has spent suspended since boot (BOOTTIME keeps counting, MONOTONIC stops)."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME) - time.clock_gettime(time.CLOCK_MONOTONIC)
+
+
+def load_config(path):
+    cfg = dict(DEFAULTS)
+    p = Path(path)
+    if p.exists():
+        with p.open("rb") as f:
+            data = tomllib.load(f)
+        for key in data:
+            if key not in DEFAULTS:
+                log(f"warning: unknown config key {key!r} in {path}")
+        cfg.update(data)
+    elif path != DEFAULT_CONFIG:
+        sys.exit(f"config not found: {path}")
+    for key in ("wake_interval", "grace_period", "awake_poll", "network_timeout", "task_timeout"):
+        cfg[key] = parse_duration(cfg[key])
+    if cfg["block_on_sessions"] not in ("active", "any", "none"):
+        sys.exit("block_on_sessions must be 'active', 'any' or 'none'")
+    return cfg
+
+
+class Task:
+    def __init__(self, path):
+        self.path = path
+        self.name = path.name
+        self.id = path.stem
+        self.headers = {}
+        try:
+            with path.open(errors="replace") as f:
+                for _, line in zip(range(40), f):
+                    m = HEADER_RE.match(line.strip())
+                    if m:
+                        self.headers[m.group(1).lower()] = m.group(2)
+        except OSError:
+            pass
+
+    @property
+    def not_before(self):
+        raw = self.headers.get("not-before")
+        if not raw:
+            return None
+        try:
+            t = dt.datetime.fromisoformat(raw)
+        except ValueError:
+            log(f"{self.name}: ignoring unparseable not-before={raw!r}")
+            return None
+        return t.astimezone() if t.tzinfo is None else t
+
+    def timeout(self, default):
+        raw = self.headers.get("timeout")
+        if raw:
+            try:
+                return parse_duration(raw)
+            except ValueError as e:
+                log(f"{self.name}: {e}; using default")
+        return default
+
+    def is_due(self, at=None):
+        nb = self.not_before
+        return nb is None or nb <= (at or now())
+
+
+class Inhibitor:
+    """Holds a logind sleep+idle block lock so neither we nor the desktop suspends mid-work."""
+
+    def __init__(self, why):
+        self.why = why
+        self.proc = None
+
+    def __enter__(self):
+        try:
+            self.proc = subprocess.Popen(
+                ["systemd-inhibit", "--what=sleep:idle", "--who=sleepq", f"--why={self.why}",
+                 "--mode=block", "sleep", "infinity"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as e:
+            log(f"could not take inhibitor lock: {e}")
+        return self
+
+    def __exit__(self, *exc):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
+class SleepQ:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.qdir = Path(cfg["queue_dir"])
+        self.state = Path(cfg["state_dir"])
+        self.queue = self.qdir / "queue"
+        self.results = self.qdir / "results"
+        self.dry = cfg["dry_run"]
+        user = cfg["run_as"] or pwd.getpwuid(os.geteuid()).pw_name
+        self.pw = pwd.getpwnam(user)
+        self.switch_user = os.geteuid() == 0 and self.pw.pw_uid != 0
+        self.host = socket.gethostname()
+
+    # ---------- running things as the task user ----------
+
+    def user_env(self):
+        env = {
+            "HOME": self.pw.pw_dir, "USER": self.pw.pw_name, "LOGNAME": self.pw.pw_name,
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+        }
+        if self.cfg["git_ssh_command"]:
+            env["GIT_SSH_COMMAND"] = self.cfg["git_ssh_command"]
+        return env
+
+    def user_kwargs(self):
+        kw = {"env": self.user_env()}
+        if self.switch_user:
+            kw.update(user=self.pw.pw_uid, group=self.pw.pw_gid,
+                      extra_groups=os.getgrouplist(self.pw.pw_name, self.pw.pw_gid))
+        return kw
+
+    def chown(self, path):
+        if not self.switch_user:
+            return
+        for p in [path, *path.rglob("*")] if path.is_dir() else [path]:
+            os.lchown(p, self.pw.pw_uid, self.pw.pw_gid)
+
+    def git(self, *args, timeout=120):
+        cmd = ["git", "-C", str(self.qdir), "-c", "user.name=sleepq",
+               "-c", f"user.email=sleepq@{self.host}", *args]
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **self.user_kwargs())
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(cmd, 124, "", "timed out")
+
+    # ---------- queue sync ----------
+
+    def sync_down(self, wait=None):
+        """Pull the queue. Retries until the network is up or `wait` seconds pass."""
+        if not self.cfg["git"]:
+            return True
+        deadline = time.monotonic() + (self.cfg["network_timeout"] if wait is None else wait)
+        while True:
+            r = self.git("pull", "--rebase", "--autostash", self.cfg["git_remote"], self.cfg["git_branch"])
+            if r.returncode == 0:
+                return True
+            if time.monotonic() >= deadline:
+                log(f"git pull failed, using local copy of the queue: {r.stderr.strip()[-300:]}")
+                return False
+            time.sleep(5)
+
+    def sync_up(self, message):
+        if not self.cfg["git"]:
+            return
+        self.git("add", "-A", "queue", "results")
+        if self.git("diff", "--cached", "--quiet").returncode == 0:
+            return
+        r = self.git("commit", "-q", "-m", message)
+        if r.returncode != 0:
+            log(f"git commit failed: {r.stderr.strip()}")
+            return
+        for _ in range(3):
+            r = self.git("push", "-q", self.cfg["git_remote"], f"HEAD:{self.cfg['git_branch']}")
+            if r.returncode == 0:
+                return
+            self.git("pull", "--rebase", "--autostash", self.cfg["git_remote"], self.cfg["git_branch"])
+        log(f"git push failed, will retry on next sync: {r.stderr.strip()[-300:]}")
+
+    # ---------- tasks ----------
+
+    def pending(self):
+        if not self.queue.is_dir():
+            return []
+        return [Task(p) for p in sorted(self.queue.iterdir())
+                if p.is_file() and not p.name.startswith(".")]
+
+    def due_tasks(self):
+        t = now()
+        return [task for task in self.pending() if task.is_due(t)]
+
+    def bump_attempts(self, task):
+        f = self.state / "attempts" / task.name
+        f.parent.mkdir(parents=True, exist_ok=True)
+        n = int(f.read_text()) + 1 if f.exists() else 1
+        f.write_text(str(n))
+        os.sync()  # make the counter survive a power cut during the task
+        return n
+
+    def run_task(self, task):
+        attempt = self.bump_attempts(task)
+        work = self.state / "work" / task.id
+        logs = self.state / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        full_log = logs / f"{task.id}.log"
+        started = now()
+        timeout = task.timeout(self.cfg["task_timeout"])
+
+        if attempt > self.cfg["max_attempts"]:
+            status, code = "interrupted", None
+            full_log.write_text(f"sleepq: task was interrupted {attempt - 1} time(s) "
+                                "(crash, power loss or daemon restart); not retrying\n")
+            log(f"{task.name}: interrupted {attempt - 1} times, marking failed")
+        else:
+            log(f"{task.name}: starting (attempt {attempt}, timeout {fmt_duration(timeout)})")
+            shutil.rmtree(work, ignore_errors=True)
+            work.mkdir(parents=True)
+            script = work / ".sleepq-task"
+            shutil.copy2(task.path, script)
+            self.chown(work)
+            env = self.user_env() | {"SLEEPQ_TASK_ID": task.id, "SLEEPQ_ATTEMPT": str(attempt)}
+            with full_log.open("wb") as out:
+                kw = self.user_kwargs() | {"env": env}
+                proc = subprocess.Popen(["/bin/bash", str(script)], cwd=work, stdin=subprocess.DEVNULL,
+                                        stdout=out, stderr=subprocess.STDOUT, start_new_session=True, **kw)
+                try:
+                    code = proc.wait(timeout)
+                    status = "ok" if code == 0 else "failed"
+                except subprocess.TimeoutExpired:
+                    log(f"{task.name}: timed out after {fmt_duration(timeout)}, killing")
+                    self.kill_group(proc)
+                    code, status = proc.returncode, "timeout"
+
+        finished = now()
+        dest = self.results / task.id
+        n = 2
+        while dest.exists():
+            dest, n = self.results / f"{task.id}-{n}", n + 1
+        dest.mkdir(parents=True)
+        shutil.move(str(task.path), dest / task.name)
+        self.copy_log_tail(full_log, dest / "output.log")
+        result = {
+            "id": task.id, "status": status, "exit_code": code, "attempt": attempt,
+            "host": self.host, "started": started.isoformat(timespec="seconds"),
+            "finished": finished.isoformat(timespec="seconds"),
+            "duration_s": round((finished - started).total_seconds(), 1),
+        }
+        (dest / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+        self.chown(dest)
+        (self.state / "attempts" / task.name).unlink(missing_ok=True)
+        if status != "interrupted":
+            shutil.rmtree(work, ignore_errors=True)
+        log(f"{task.name}: {status} (exit {code}) in {fmt_duration(result['duration_s'])}")
+        self.sync_up(f"sleepq: {task.id} {status}")
+
+    @staticmethod
+    def kill_group(proc):
+        for sig, wait in ((signal.SIGTERM, 30), (signal.SIGKILL, 10)):
+            try:
+                os.killpg(proc.pid, sig)
+            except ProcessLookupError:
+                return
+            try:
+                proc.wait(wait)
+                return
+            except subprocess.TimeoutExpired:
+                continue
+
+    def copy_log_tail(self, src, dst):
+        limit = int(self.cfg["max_log_bytes"])
+        size = src.stat().st_size
+        with src.open("rb") as f, dst.open("wb") as out:
+            if size > limit:
+                f.seek(size - limit)
+                f.readline()  # skip the partial first line
+                out.write(f"[sleepq: output truncated, showing last ~{limit} of {size} bytes; "
+                          f"full log on {self.host}:{src}]\n".encode())
+            shutil.copyfileobj(f, out)
+
+    def process(self):
+        """Run due tasks until none are left, picking up tasks submitted meanwhile."""
+        while True:
+            due = self.due_tasks()
+            if not due:
+                return
+            self.run_task(due[0])
+            self.sync_down(wait=15)
+
+    # ---------- deciding whether to sleep ----------
+
+    def blocking_sessions(self):
+        mode = self.cfg["block_on_sessions"]
+        if mode == "none":
+            return []
+        out = subprocess.run(["loginctl", "list-sessions", "--no-legend"],
+                             capture_output=True, text=True).stdout
+        blockers = []
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            sid = line.split()[0]
+            props = subprocess.run(
+                ["loginctl", "show-session", sid, "-p", "Class", "-p", "Active", "-p", "IdleHint",
+                 "-p", "Remote", "-p", "State", "-p", "Name", "-p", "Type", "-p", "TTY"],
+                capture_output=True, text=True).stdout
+            p = dict(l.split("=", 1) for l in props.splitlines() if "=" in l)
+            if p.get("Class") != "user" or p.get("State") == "closing":
+                continue
+            remote = p.get("Remote") == "yes"
+            busy = (p.get("Active") == "yes" or remote) and p.get("IdleHint") != "yes"
+            if mode == "any" or busy:
+                where = "ssh" if remote else (p.get("Type") or p.get("TTY") or "local")
+                blockers.append(f"session {sid} ({p.get('Name')}, {where})")
+        return blockers
+
+    def stay_awake_reasons(self):
+        reasons = []
+        if (self.state / "hold").exists():
+            reasons.append("local hold (sleepq release to clear)")
+        if (self.qdir / "HOLD").exists():
+            reasons.append("HOLD file in queue repo")
+        reasons += self.blocking_sessions()
+        return reasons
+
+    def next_wake(self):
+        t = now()
+        wake = t + dt.timedelta(seconds=self.cfg["wake_interval"])
+        for task in self.pending():
+            nb = task.not_before
+            if nb and t < nb < wake:
+                wake = nb
+        return max(wake, t + dt.timedelta(seconds=60))
+
+    def arm(self):
+        wake = self.next_wake()
+        if self.dry:
+            log(f"[dry-run] would set RTC wake alarm for {wake:%Y-%m-%d %H:%M:%S}")
+            return wake
+        r = subprocess.run(["rtcwake", "-m", "no", "-t", str(int(wake.timestamp()))],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            log(f"RTC wake alarm set for {wake:%Y-%m-%d %H:%M:%S}")
+        else:
+            log(f"failed to set RTC wake alarm: {r.stderr.strip()}")
+        return wake
+
+    def suspend(self):
+        wake = self.arm()
+        if self.dry:
+            secs = max(0, (wake - now()).total_seconds())
+            log(f"[dry-run] would suspend now; sleeping {fmt_duration(secs)} instead")
+            time.sleep(secs)
+            return True
+        before = sleep_offset()
+        log("suspending")
+        r = subprocess.run(["systemctl", "suspend"], capture_output=True, text=True)
+        if r.returncode != 0:
+            log(f"systemctl suspend failed: {r.stderr.strip()}")
+            return False
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            time.sleep(2)
+            slept = sleep_offset() - before
+            if slept > 1:
+                log(f"resumed after {fmt_duration(slept)} asleep")
+                return True
+        log("suspend did not happen within 2 minutes (blocked by another inhibitor?)")
+        return False
+
+    # ---------- main loop ----------
+
+    def daemon(self):
+        log(f"sleepq starting: queue={self.qdir} user={self.pw.pw_name} "
+            f"interval={fmt_duration(self.cfg['wake_interval'])}{' DRY-RUN' if self.dry else ''}")
+        self.state.mkdir(parents=True, exist_ok=True)
+        grace = self.cfg["grace_period"]
+        while True:
+            with Inhibitor("running queued tasks"):
+                self.sync_down()
+                while True:
+                    self.process()
+                    if grace <= 0 or self.stay_awake_reasons():
+                        break
+                    log(f"queue empty; grace period {fmt_duration(grace)} before suspend")
+                    time.sleep(grace)
+                    self.sync_down(wait=15)
+                    if not self.due_tasks():
+                        break
+            reasons = self.stay_awake_reasons()
+            if reasons:
+                log(f"staying awake ({'; '.join(reasons)}); re-checking in "
+                    f"{fmt_duration(self.cfg['awake_poll'])}")
+                time.sleep(self.cfg["awake_poll"])
+                continue
+            if not self.suspend():
+                time.sleep(self.cfg["awake_poll"])
+
+    def status(self):
+        print(f"queue:       {self.qdir}  (git={'yes' if self.cfg['git'] else 'no'}, "
+              f"run_as={self.pw.pw_name}{', dry-run' if self.dry else ''})")
+        print(f"interval:    {fmt_duration(self.cfg['wake_interval'])}")
+        try:
+            raw = Path("/sys/class/rtc/rtc0/wakealarm").read_text().strip()
+            alarm = dt.datetime.fromtimestamp(int(raw)).astimezone().strftime("%Y-%m-%d %H:%M:%S") \
+                if raw else "none"
+        except (OSError, ValueError):
+            alarm = "unknown"
+        print(f"rtc alarm:   {alarm}")
+        print(f"next wake:   {self.next_wake():%Y-%m-%d %H:%M:%S} (if it suspended now)")
+        reasons = self.stay_awake_reasons()
+        print(f"stay awake:  {'; '.join(reasons) if reasons else 'no'}")
+        tasks = self.pending()
+        print(f"pending:     {len(tasks)}")
+        for t in tasks:
+            nb = t.not_before
+            print(f"  {t.name}" + (f"  (not before {nb:%Y-%m-%d %H:%M})" if nb else ""))
+
+
+def submit(args):
+    repo = Path(args.repo).expanduser()
+    if not (repo / ".git").exists() and not args.no_git:
+        sys.exit(f"{repo} is not a git clone (use --no-git for a plain directory)")
+
+    def git(*a):
+        r = subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.exit(f"git {' '.join(a)} failed:\n{r.stderr}")
+
+    if args.command:
+        body, name = f"#!/bin/bash\nset -euo pipefail\n{args.command}\n", args.name or "cmd"
+    elif args.script == "-":
+        body, name = sys.stdin.read(), args.name or "stdin"
+    elif args.script:
+        p = Path(args.script)
+        body, name = p.read_text(), args.name or p.stem
+    else:
+        sys.exit("give a script path, '-' for stdin, or -c COMMAND")
+
+    headers = []
+    if args.not_before:
+        nb = dt.datetime.fromisoformat(args.not_before)
+        headers.append(f"# sleepq: not-before={(nb if nb.tzinfo else nb.astimezone()).isoformat(timespec='seconds')}")
+    if args.timeout:
+        parse_duration(args.timeout)
+        headers.append(f"# sleepq: timeout={args.timeout}")
+    if headers:
+        lines = body.splitlines(keepends=True)
+        at = 1 if lines and lines[0].startswith("#!") else 0
+        body = "".join(lines[:at] + [h + "\n" for h in headers] + lines[at:])
+
+    if not args.no_git:
+        git("pull", "-q", "--rebase", "--autostash")
+    name = re.sub(r"[^\w.-]+", "-", name).strip("-") or "task"
+    task_id = f"{dt.datetime.now():%Y%m%d-%H%M%S}-{name}"
+    dest = repo / "queue" / f"{task_id}.sh"
+    dest.parent.mkdir(exist_ok=True)
+    dest.write_text(body)
+    if not args.no_git:
+        git("add", str(dest.relative_to(repo)))
+        git("commit", "-q", "-m", f"submit {task_id}")
+        git("push", "-q")
+    print(f"queued {task_id}; results will appear in results/{task_id}/")
+
+
+def setup(args):
+    """One-time machine setup after installing the package: set run_as, clone the queue repo."""
+    if os.geteuid() != 0:
+        sys.exit("run with sudo")
+    user = args.user or os.environ.get("SUDO_USER")
+    if not user or user == "root":
+        sys.exit("can't tell which user should run tasks; pass --user NAME")
+    pw = pwd.getpwnam(user)
+
+    cfg_path = Path(args.config)
+    text = cfg_path.read_text()
+    new, n = re.subn(r'(?m)^run_as\s*=\s*"[^"]*"', f'run_as = "{user}"', text)
+    if n == 0:
+        new = text.rstrip("\n") + f'\nrun_as = "{user}"\n'
+    if new != text:
+        cfg_path.write_text(new)
+    print(f"{cfg_path}: run_as = {user}")
+
+    cfg = load_config(args.config)
+    repo = Path(cfg["queue_dir"])
+    if args.url:
+        if (repo / ".git").exists():
+            print(f"{repo} is already a clone; leaving it alone")
+        else:
+            if repo.exists() and any(repo.iterdir()):
+                sys.exit(f"{repo} exists and is not empty")
+            repo.mkdir(parents=True, exist_ok=True)
+            os.chown(repo, pw.pw_uid, pw.pw_gid)
+            cmd = ["git", "clone"]
+            if args.key:
+                key = Path(args.key).expanduser().resolve()
+                if not key.exists():
+                    sys.exit(f"key not found: {key}")
+                # stored in the clone's config, so every git call from the service uses it
+                cmd += ["-c", f"core.sshCommand=ssh -i {key} -o IdentitiesOnly=yes -o BatchMode=yes"]
+            cmd += [args.url, str(repo)]
+            r = subprocess.run(cmd, user=pw.pw_uid, group=pw.pw_gid,
+                               extra_groups=os.getgrouplist(user, pw.pw_gid),
+                               env={"HOME": pw.pw_dir, "USER": user, "PATH": "/usr/bin:/bin"})
+            if r.returncode != 0:
+                sys.exit("git clone failed")
+            print(f"cloned {args.url} into {repo}")
+    elif not (repo / ".git").exists() and cfg["git"]:
+        print(f"note: {repo} is not a clone yet; rerun with the repo URL")
+
+    print(f"\nNext: check {cfg_path} (dry_run is {'on' if cfg['dry_run'] else 'off'}), then\n"
+          "  sudo systemctl enable --now sleepq\n  journalctl -u sleepq -f")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="sleepq", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--config", default=DEFAULT_CONFIG)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("daemon", help="run the wake/run/suspend loop (normally via systemd)")
+    sub.add_parser("arm", help="set the RTC wake alarm for the next check (used by the sleep hook)")
+    sub.add_parser("status", help="show queue, alarm and what keeps the machine awake")
+    sub.add_parser("hold", help="keep this machine awake until 'sleepq release'")
+    sub.add_parser("release", help="undo 'sleepq hold'")
+    s = sub.add_parser("submit", help="add a task to a queue clone and push it (run on any machine)")
+    s.add_argument("script", nargs="?", help="script file, or - for stdin")
+    s.add_argument("-c", "--command", help="queue a one-line shell command instead of a script")
+    s.add_argument("--repo", default=os.environ.get("SLEEPQ_REPO", "."), help="path to your clone of the queue repo")
+    s.add_argument("--name", help="short name used in the task id")
+    s.add_argument("--not-before", help="earliest start, e.g. 2026-11-21T14:20")
+    s.add_argument("--timeout", help="per-task time limit, e.g. 2h")
+    s.add_argument("--no-git", action="store_true", help="plain directory: don't pull/commit/push")
+    s = sub.add_parser("setup", help="one-time setup: set run_as and clone the queue repo (run with sudo)")
+    s.add_argument("url", nargs="?", help="queue repo URL, e.g. git@github.com:you/sleepq-queue.git")
+    s.add_argument("key", nargs="?", help="deploy key for that repo, e.g. ~/.ssh/sleepq_deploy")
+    s.add_argument("--user", help="user that runs tasks (default: the user who ran sudo)")
+    args = ap.parse_args()
+
+    if args.cmd == "submit":
+        return submit(args)
+    if args.cmd == "setup":
+        return setup(args)
+    q = SleepQ(load_config(args.config))
+    if args.cmd == "daemon":
+        if os.geteuid() == 0 and q.pw.pw_uid == 0:
+            sys.exit(f"refusing to run tasks as root: set run_as in {args.config} "
+                     "(or run 'sudo sleepq setup')")
+        q.daemon()
+    elif args.cmd == "arm":
+        q.arm()
+    elif args.cmd == "status":
+        q.status()
+    elif args.cmd == "hold":
+        q.state.mkdir(parents=True, exist_ok=True)
+        (q.state / "hold").touch()
+        print("holding: this machine will not suspend until 'sleepq release'")
+    elif args.cmd == "release":
+        (q.state / "hold").unlink(missing_ok=True)
+        print("released")
+
+
+if __name__ == "__main__":
+    main()

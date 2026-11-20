@@ -1,0 +1,31 @@
+# /etc/sleepq/config.toml
+
+# Clone of your queue repo (holds queue/ and results/). Owned by run_as.
+queue_dir = "/var/lib/sleepq/repo"
+state_dir = "/var/lib/sleepq/state"
+
+# Pull before checking, push results after each task. false = plain directory (e.g. a NAS mount).
+git = true
+git_remote = "origin"
+git_branch = "main"
+# Usually not needed: `sleepq setup URL KEY` stores the key in the clone itself.
+# git_ssh_command = "ssh -i /home/YOU/.ssh/sleepq_deploy -o IdentitiesOnly=yes"
+
+# Tasks and git run as this user, never as root.
+run_as = ""   # set by `sudo sleepq setup`; the daemon refuses to run tasks as root
+
+wake_interval   = "1h"   # sleep this long when there is nothing to do
+grace_period    = "3m"   # stay up after the last task, so you can SSH in
+awake_poll      = "5m"   # re-check interval while something keeps the machine awake
+network_timeout = "90s"  # wait this long for the network after resume
+task_timeout    = "6h"   # default limit per task ("# sleepq: timeout=..." overrides)
+max_attempts    = 2      # give up on a task interrupted this many times (power loss, crash)
+max_log_bytes   = 1000000
+
+# "active": an active, non-idle local session or any SSH session prevents suspend
+# "any":    any login session prevents suspend
+# "none":   suspend regardless of who is logged in
+block_on_sessions = "active"
+
+# Log what would happen instead of setting the alarm and suspending.
+dry_run = true   # set to false once a dry run looks right

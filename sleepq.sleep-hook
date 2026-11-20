@@ -1,0 +1,9 @@
+#!/bin/sh
+# /usr/lib/systemd/system-sleep/sleepq
+# Runs before every suspend/hibernate, including ones you trigger yourself (lid, menu,
+# idle timer), so the machine always wakes for the next queue check. Does nothing
+# unless sleepq.service is enabled, so installing the package alone changes nothing.
+[ "$1" = pre ] || exit 0
+systemctl -q is-enabled sleepq.service 2>/dev/null || exit 0
+/usr/bin/sleepq arm
+exit 0

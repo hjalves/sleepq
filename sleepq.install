@@ -1,0 +1,16 @@
+post_install() {
+  cat <<'MSG'
+==> sleepq is installed but inactive. To set it up:
+      sudo sleepq setup git@github.com:YOU/sleepq-queue.git ~/.ssh/sleepq_deploy
+      sudo systemctl enable --now sleepq
+    /etc/sleepq/config.toml starts with dry_run = true.
+MSG
+}
+
+pre_remove() {
+  systemctl disable --now sleepq.service >/dev/null 2>&1 || true
+}
+
+post_remove() {
+  echo "==> /var/lib/sleepq (queue clone, logs) was left in place; remove it by hand if unwanted."
+}

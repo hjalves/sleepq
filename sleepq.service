@@ -1,0 +1,13 @@
+[Unit]
+Description=sleepq: run queued tasks, then suspend until the next check
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sleepq daemon
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
