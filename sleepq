@@ -153,7 +153,10 @@ class Task:
 
 
 class Inhibitor:
-    """Holds a logind sleep+idle block lock so neither we nor the desktop suspends mid-work."""
+    """Holds a logind sleep block lock so neither we nor the desktop's idle timer suspends mid-work.
+
+    Deliberately not "idle": an idle lock makes swayidle and desktops reset the session's
+    IdleHint and restart their idle timers, so the session would never be seen as idle."""
 
     def __init__(self, why):
         self.why = why
@@ -162,7 +165,7 @@ class Inhibitor:
     def __enter__(self):
         try:
             self.proc = subprocess.Popen(
-                ["systemd-inhibit", "--what=sleep:idle", "--who=sleepq", f"--why={self.why}",
+                ["systemd-inhibit", "--what=sleep", "--who=sleepq", f"--why={self.why}",
                  "--mode=block", "sleep", "infinity"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as e:

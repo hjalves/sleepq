@@ -58,8 +58,9 @@ Results land in `results/<task-id>/`: the script, `output.log` (tail, capped by 
 
 - **What gets run:** due tasks in filename order, one at a time, as `run_as` (never root), in a scratch
   dir. Tasks submitted while it's working are picked up before it sleeps.
-- **No suspending mid-task:** a logind sleep+idle inhibitor is held while working, so neither sleepq nor
-  your desktop's idle timer suspends mid-task.
+- **No suspending mid-task:** a logind sleep inhibitor is held while working, so neither sleepq nor
+  your desktop's idle timer suspends mid-task (closing a lid still does). It doesn't block *idle*, which
+  would keep resetting idle detection.
 - **When it won't suspend:**
   - an active, non-idle local session (you're at the desktop)
   - any SSH session (SSH in during the grace period to keep it up)
