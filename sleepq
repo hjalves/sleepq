@@ -277,12 +277,19 @@ class SleepQ:
         os.sync()  # make the counter survive a power cut during the task
         return n
 
+    def prepare_state_dirs(self):
+        """state/ is traversable (0711) so the task user can reach its own folder under work/;
+        logs/ and attempts/ stay private to the daemon."""
+        for sub, mode in (("", 0o711), ("work", 0o755), ("logs", 0o700), ("attempts", 0o700)):
+            d = self.state / sub
+            d.mkdir(parents=True, exist_ok=True)
+            os.chmod(d, mode)
+
     def run_task(self, task):
+        self.prepare_state_dirs()
         attempt = self.bump_attempts(task)
         work = self.state / "work" / task.id
-        logs = self.state / "logs"
-        logs.mkdir(parents=True, exist_ok=True)
-        full_log = logs / f"{task.id}.log"
+        full_log = self.state / "logs" / f"{task.id}.log"
         started = now()
         timeout = task.timeout(self.cfg["task_timeout"])
 
@@ -452,7 +459,7 @@ class SleepQ:
     def daemon(self):
         log(f"sleepq starting: queue={self.qdir} user={self.pw.pw_name} "
             f"interval={fmt_duration(self.cfg['wake_interval'])}{' DRY-RUN' if self.dry else ''}")
-        self.state.mkdir(parents=True, exist_ok=True)
+        self.prepare_state_dirs()
         grace = self.cfg["grace_period"]
         while True:
             with Inhibitor("running queued tasks"):
