@@ -2,7 +2,7 @@
 
 Lets a machine without Wake-on-LAN take jobs on demand while sleeping most of the time.
 
-It wakes on its RTC alarm every hour (configurable), pulls a task queue from a git repo, runs
+It wakes on its RTC alarm at the top of every hour (configurable), pulls a task queue from a git repo, runs
 whatever is due, pushes the results back, waits a short grace period, then suspends again.
 Because the machine can't be reached while asleep, the queue lives in a git remote that is always online.
 
@@ -73,8 +73,12 @@ Results land in `results/<task-id>/`: the script, `output.log` (tail, capped by 
 - **Power loss / crash:** a task that was running is retried; after `max_attempts` interruptions it's
   marked `interrupted` instead of looping forever. Set "Restore on AC power loss" in the BIOS so the
   machine boots again after an outage.
-- **Wake times:** a task can wait up to one `wake_interval` before it starts. The alarm overwrites
-  any other RTC alarm.
+- **Wake times:** with `align_wakes = true` (the default) it wakes on the clock, at multiples of
+  `wake_interval` from local midnight: with `1h`, every hour at :00. So you know the next wake without
+  asking the machine. A slot less than 5 minutes away is skipped. Intervals that don't divide 24h
+  restart at midnight, for example 7h wakes at 00:00, 07:00, 14:00 and 21:00. A task's `not-before`
+  moves the wake earlier, to that time. A task can wait up to one `wake_interval` before it starts.
+  The alarm overwrites any other RTC alarm.
 
 `sudo sleepq status` shows pending tasks, the current alarm and what's keeping the machine awake.
 

@@ -15,6 +15,10 @@ git_branch = "main"
 run_as = ""   # set by `sudo sleepq setup`; the daemon refuses to run tasks as root
 
 wake_interval   = "1h"   # sleep this long when there is nothing to do
+# Wake on the clock: at multiples of wake_interval counted from local midnight (1h -> every :00,
+# 30m -> :00 and :30), skipping a slot less than 5 min away. The next wake is then predictable
+# without asking the machine. false = sleep wake_interval from whenever it suspends.
+align_wakes     = true
 grace_period    = "3m"   # stay up after the last task, so you can SSH in
 awake_poll      = "5m"   # re-check interval while something keeps the machine awake
 network_timeout = "90s"  # wait this long for the network after resume

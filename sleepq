@@ -18,6 +18,7 @@ Subcommands: setup, daemon, arm, status, submit, hold, release.
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import pwd
 import re
@@ -41,6 +42,7 @@ DEFAULTS = {
     "git_ssh_command": "",                 # e.g. "ssh -i /home/me/.ssh/sleepq_deploy -o IdentitiesOnly=yes"
     "run_as": "",                          # user that runs tasks and git; empty = the daemon's own user
     "wake_interval": "1h",                 # how long to sleep when there is nothing to do
+    "align_wakes": True,                   # wake on the clock (multiples of wake_interval from midnight)
     "grace_period": "3m",                  # stay up this long after the last task (time to SSH in)
     "awake_poll": "5m",                    # re-check interval while something keeps the machine awake
     "network_timeout": "90s",              # how long to wait for the network after resume
@@ -55,6 +57,7 @@ DEFAULTS = {
 HEADER_RE = re.compile(r"^#\s*sleepq:\s*([\w-]+)\s*=\s*(.+?)\s*$")
 DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([smhd]?)")
 UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+MIN_ALIGNED_SLEEP = 300  # with align_wakes, skip a slot closer than this (no 2-minute naps)
 
 
 def log(msg):
@@ -106,6 +109,11 @@ def load_config(path):
         sys.exit(f"config not found: {path}")
     for key in ("wake_interval", "grace_period", "awake_poll", "network_timeout", "task_timeout"):
         cfg[key] = parse_duration(cfg[key])
+    if cfg["wake_interval"] < 60:
+        sys.exit("wake_interval must be at least 60s")
+    if cfg["align_wakes"] and cfg["wake_interval"] > 86400:
+        log("warning: align_wakes needs wake_interval <= 24h; wakes will not be aligned")
+        cfg["align_wakes"] = False
     if cfg["block_on_sessions"] not in ("active", "any", "none"):
         sys.exit("block_on_sessions must be 'active', 'any' or 'none'")
     return cfg
@@ -412,9 +420,24 @@ class SleepQ:
         reasons += self.blocking_sessions()
         return reasons
 
+    def aligned_wake(self, t):
+        """Next clock slot (midnight + k * wake_interval, restarting each midnight) at least
+        MIN_ALIGNED_SLEEP after t, so the schedule is known without asking the machine."""
+        interval = self.cfg["wake_interval"]
+        local = t.replace(tzinfo=None) if t.tzinfo is None else t.astimezone().replace(tzinfo=None)
+        earliest = local + dt.timedelta(seconds=MIN_ALIGNED_SLEEP)
+        midnight = earliest.replace(hour=0, minute=0, second=0, microsecond=0)
+        k = math.ceil((earliest - midnight).total_seconds() / interval)
+        slot = midnight + dt.timedelta(seconds=k * interval)
+        slot = min(slot, midnight + dt.timedelta(days=1))  # intervals not dividing 24h restart at midnight
+        return slot.astimezone()  # naive local -> aware, using the offset in effect at that time
+
     def next_wake(self):
         t = now()
-        wake = t + dt.timedelta(seconds=self.cfg["wake_interval"])
+        if self.cfg["align_wakes"]:
+            wake = self.aligned_wake(t)
+        else:
+            wake = t + dt.timedelta(seconds=self.cfg["wake_interval"])
         for task in self.pending():
             nb = task.not_before
             if nb and t < nb < wake:
@@ -461,7 +484,7 @@ class SleepQ:
 
     def daemon(self):
         log(f"sleepq starting: queue={self.qdir} user={self.pw.pw_name} "
-            f"interval={fmt_duration(self.cfg['wake_interval'])}{' DRY-RUN' if self.dry else ''}")
+            f"interval={fmt_duration(self.cfg['wake_interval'])}{' aligned' if self.cfg['align_wakes'] else ''}{' DRY-RUN' if self.dry else ''}")
         self.prepare_state_dirs()
         grace = self.cfg["grace_period"]
         while True:
@@ -488,7 +511,8 @@ class SleepQ:
     def status(self):
         print(f"queue:       {self.qdir}  (git={'yes' if self.cfg['git'] else 'no'}, "
               f"run_as={self.pw.pw_name}{', dry-run' if self.dry else ''})")
-        print(f"interval:    {fmt_duration(self.cfg['wake_interval'])}")
+        print(f"interval:    {fmt_duration(self.cfg['wake_interval'])}"
+              f"{' (aligned to the clock)' if self.cfg['align_wakes'] else ''}")
         try:
             raw = Path("/sys/class/rtc/rtc0/wakealarm").read_text().strip()
             alarm = dt.datetime.fromtimestamp(int(raw)).astimezone().strftime("%Y-%m-%d %H:%M:%S") \

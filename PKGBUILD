@@ -1,7 +1,7 @@
 # Local package: build with `makepkg -si` from this directory.
 pkgname=sleepq
 pkgver=0.1.0
-pkgrel=3
+pkgrel=4
 pkgdesc="Wake on RTC alarm, run tasks queued in a git repo, then suspend again"
 arch=('any')
 license=('MIT')
@@ -14,12 +14,12 @@ source=('sleepq'
         'sleepq.tmpfiles'
         'config.toml'
         'README.md')
-sha256sums=('739e2d40077621b77efff487eadea8494412f17a24f99ed19e0927ad095a2bda'
+sha256sums=('3a1cd72a66ab555ca018a653623b20b4bd15f70dccc96d3dd72c14b13bd978df'
             '867b079b83c1a8a656f1f054326c811f1378637b7135139247d7d07cf09bce4c'
             '2a51bc7d5b064aead6175a3e13e2ef49e2aab159c3a5532f5f2614e3b2424cc8'
             '81493360677d8375d5d329850b3032a6ba648ac190e8bb13629b7247ee284ab1'
-            'e3423f790dde98317a2f2594e969d3c0e4f0d5eac91b66e52e40194f7abee1c7'
-            '67a022ec6a1c461e301920b503978ba3c4cc585c20730931bd7228b853366239')
+            '8332c9650c8c24ccf6e81c71df323a1193e9164ae4df43a375cc8bfba76724f9'
+            '569ff263bbcf664693818faa727bb236ce5c0085f685f15d6196a4e00f9804fa')
 
 package() {
   install -Dm755 sleepq             "$pkgdir/usr/bin/sleepq"
