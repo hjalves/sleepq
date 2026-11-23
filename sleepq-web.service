@@ -1,0 +1,12 @@
+[Unit]
+Description=sleepq web: status page with hold/release buttons
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sleepq web
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

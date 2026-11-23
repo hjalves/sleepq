@@ -12,7 +12,7 @@ Optional headers inside a task script:
     # sleepq: not-before=2026-11-21T14:20     (local time unless an offset is given)
     # sleepq: timeout=2h
 
-Subcommands: setup, daemon, arm, status, submit, hold, release.
+Subcommands: setup, daemon, arm, status, submit, hold, release, web.
 """
 
 import argparse
@@ -52,6 +52,7 @@ DEFAULTS = {
     "block_on_sessions": "active",         # "active": non-idle local or any SSH session blocks suspend
                                            # "any": any login session blocks; "none": ignore sessions
     "dry_run": False,                      # log instead of setting the RTC alarm / suspending
+    "web_listen": "0.0.0.0:8377",          # address:port for `sleepq web` (sleepq-web.service)
 }
 
 HEADER_RE = re.compile(r"^#\s*sleepq:\s*([\w-]+)\s*=\s*(.+?)\s*$")
@@ -508,18 +509,42 @@ class SleepQ:
             if not self.suspend():
                 time.sleep(self.cfg["awake_poll"])
 
+    def rtc_alarm(self):
+        try:
+            raw = Path("/sys/class/rtc/rtc0/wakealarm").read_text().strip()
+            return dt.datetime.fromtimestamp(int(raw)).astimezone() if raw else None
+        except (OSError, ValueError):
+            return "unknown"
+
+    def local_hold(self):
+        return (self.state / "hold").exists()
+
+    def set_hold(self, on):
+        if on:
+            self.state.mkdir(parents=True, exist_ok=True)
+            (self.state / "hold").touch()
+        else:
+            (self.state / "hold").unlink(missing_ok=True)
+
+    def recent_results(self, limit=10):
+        if not self.results.is_dir():
+            return []
+        out = []
+        for d in sorted((d for d in self.results.iterdir() if d.is_dir()), reverse=True)[:limit]:
+            try:
+                out.append(json.loads((d / "result.json").read_text()) | {"dir": d.name})
+            except (OSError, ValueError):
+                out.append({"id": d.name, "dir": d.name, "status": "?"})
+        return out
+
     def status(self):
         print(f"queue:       {self.qdir}  (git={'yes' if self.cfg['git'] else 'no'}, "
               f"run_as={self.pw.pw_name}{', dry-run' if self.dry else ''})")
         print(f"interval:    {fmt_duration(self.cfg['wake_interval'])}"
               f"{' (aligned to the clock)' if self.cfg['align_wakes'] else ''}")
-        try:
-            raw = Path("/sys/class/rtc/rtc0/wakealarm").read_text().strip()
-            alarm = dt.datetime.fromtimestamp(int(raw)).astimezone().strftime("%Y-%m-%d %H:%M:%S") \
-                if raw else "none"
-        except (OSError, ValueError):
-            alarm = "unknown"
-        print(f"rtc alarm:   {alarm}")
+        alarm = self.rtc_alarm()
+        print(f"rtc alarm:   {alarm:%Y-%m-%d %H:%M:%S}" if isinstance(alarm, dt.datetime) else
+              f"rtc alarm:   {alarm or 'none'}")
         print(f"next wake:   {self.next_wake():%Y-%m-%d %H:%M:%S} (if it suspended now)")
         reasons = self.stay_awake_reasons()
         print(f"stay awake:  {'; '.join(reasons) if reasons else 'no'}")
@@ -528,6 +553,167 @@ class SleepQ:
         for t in tasks:
             nb = t.not_before
             print(f"  {t.name}" + (f"  (not before {nb:%Y-%m-%d %H:%M})" if nb else ""))
+
+    def status_info(self):
+        def iso(t):
+            return t.isoformat(timespec="seconds") if isinstance(t, dt.datetime) else t
+        daemon = subprocess.run(["systemctl", "is-active", "sleepq.service"],
+                                capture_output=True, text=True).stdout.strip()
+        journal = subprocess.run(["journalctl", "-u", "sleepq.service", "-n", "15", "-o", "short-iso",
+                                  "--no-pager", "-q"], capture_output=True, text=True).stdout
+        return {
+            "host": self.host, "now": iso(now()), "daemon": daemon, "dry_run": self.dry,
+            "run_as": self.pw.pw_name, "queue_dir": str(self.qdir),
+            "interval": fmt_duration(self.cfg["wake_interval"]), "aligned": self.cfg["align_wakes"],
+            "rtc_alarm": iso(self.rtc_alarm()), "next_wake": iso(self.next_wake()),
+            "local_hold": self.local_hold(), "remote_hold": (self.qdir / "HOLD").exists(),
+            "stay_awake": self.stay_awake_reasons(),
+            "pending": [{"name": t.name, "not_before": iso(t.not_before)} for t in self.pending()],
+            "results": self.recent_results(), "journal": journal.splitlines(),
+        }
+
+    def web(self, listen):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        q = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def send(self, code, body, ctype="application/json"):
+                data = body if isinstance(body, bytes) else (
+                    body.encode() if isinstance(body, str) else json.dumps(body).encode())
+                self.send_response(code)
+                self.send_header("Content-Type", f"{ctype}; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path == "/":
+                    return self.send(200, WEB_PAGE, "text/html")
+                if path == "/api/status":
+                    return self.send(200, q.status_info())
+                m = re.fullmatch(r"/api/log/([\w.-]+)", path)
+                if m and q.results.is_dir() and m.group(1) in {d.name for d in q.results.iterdir()}:
+                    f = q.results / m.group(1) / "output.log"
+                    return self.send(200, f.read_bytes() if f.exists() else b"(no output.log)",
+                                     "text/plain")
+                self.send(404, {"error": "not found"})
+
+            def do_POST(self):
+                # The custom header can't be sent cross-origin without a preflight we never
+                # answer, so other web pages can't hold/release on a visitor's behalf.
+                if self.headers.get("X-Sleepq") != "1":
+                    return self.send(403, {"error": "missing X-Sleepq header"})
+                if self.path in ("/api/hold", "/api/release"):
+                    q.set_hold(self.path == "/api/hold")
+                    log(f"web: {self.path.rsplit('/', 1)[1]} from {self.client_address[0]}")
+                    return self.send(200, q.status_info())
+                self.send(404, {"error": "not found"})
+
+            def log_message(self, fmt, *args):
+                pass
+
+        host, _, port = listen.rpartition(":")
+        server = ThreadingHTTPServer((host.strip("[]") or "0.0.0.0", int(port)), Handler)
+        log(f"sleepq web listening on {listen}")
+        server.serve_forever()
+
+
+WEB_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sleepq</title>
+<style>
+  :root { color-scheme: light dark; --ok:#2e9e5b; --bad:#d0453a; --warn:#d99a1e; --mute:#888; }
+  body { font: 15px/1.45 system-ui, sans-serif; max-width: 46rem; margin: 0 auto; padding: 1rem; }
+  h1 { font-size: 1.3rem; margin: 0 0 .2rem; } h2 { font-size: 1rem; margin: 1.4rem 0 .4rem; }
+  .mute { color: var(--mute); } .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+  table { border-collapse: collapse; width: 100%; } td { padding: .2rem .5rem .2rem 0; vertical-align: top; }
+  td:first-child { color: var(--mute); white-space: nowrap; width: 8rem; }
+  .hold { display: flex; gap: .6rem; align-items: center; margin: 1rem 0; padding: .8rem;
+          border-radius: .5rem; background: color-mix(in srgb, currentColor 7%, transparent); }
+  button { font: inherit; padding: .5rem 1.1rem; border-radius: .4rem; border: 1px solid var(--mute);
+           cursor: pointer; background: transparent; color: inherit; }
+  button.primary { background: #3b6fd8; border-color: #3b6fd8; color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  pre { font-size: 12px; overflow-x: auto; padding: .6rem; border-radius: .4rem;
+        background: color-mix(in srgb, currentColor 7%, transparent); white-space: pre-wrap; }
+  ul { padding-left: 1.2rem; margin: .2rem 0; } a { color: #3b6fd8; }
+</style></head>
+<body>
+<h1 id="title">sleepq</h1>
+<div class="mute" id="sub">loading…</div>
+<div class="hold">
+  <div style="flex:1" id="holdtext"></div>
+  <button id="holdbtn" class="primary" onclick="act('hold')">Hold</button>
+  <button id="relbtn" onclick="act('release')">Release</button>
+</div>
+<table id="info"></table>
+<h2>Pending tasks</h2><div id="pending"></div>
+<h2>Recent results</h2><table id="results"></table>
+<pre id="log" hidden></pre>
+<h2>Daemon log</h2><pre id="journal"></pre>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const fmt = t => {
+  if (!t || t === "unknown") return t || "none";
+  const d = new Date(t), mins = Math.round((d - Date.now()) / 60000);
+  const a = Math.abs(mins), span = a < 90 ? `${a} min` : a < 2880 ? `${Math.round(a / 60)} h` : `${Math.round(a / 1440)} days`;
+  const rel = mins === 0 ? "now" : mins > 0 ? `in ${span}` : `${span} ago`;
+  return `${d.toLocaleString([], {dateStyle: "short", timeStyle: "short"})} <span class="mute">(${rel})</span>`;
+};
+const cls = {ok: "ok", failed: "bad", timeout: "bad", interrupted: "warn"};
+
+function render(s) {
+  document.title = `sleepq · ${s.host}`;
+  $("title").textContent = `sleepq · ${s.host}`;
+  $("sub").innerHTML = `daemon <b class="${s.daemon === "active" ? "ok" : "bad"}">${esc(s.daemon)}</b>`
+    + (s.dry_run ? ' · <b class="warn">dry run</b>' : "") + ` · updated ${new Date().toLocaleTimeString()}`;
+  $("holdtext").innerHTML = s.local_hold
+    ? '<b class="warn">Held</b> — this machine will not suspend until released.'
+    : 'Not held — it suspends when idle.';
+  $("holdbtn").disabled = s.local_hold; $("relbtn").disabled = !s.local_hold;
+  const awake = s.stay_awake.length
+    ? "<ul>" + s.stay_awake.map(r => `<li>${esc(r)}</li>`).join("") + "</ul>" : '<span class="mute">nothing</span>';
+  $("info").innerHTML = [
+    ["Kept awake by", awake],
+    ["Remote HOLD", s.remote_hold ? '<b class="warn">yes</b> (HOLD file in queue repo)' : "no"],
+    ["RTC alarm", fmt(s.rtc_alarm)],
+    ["Next wake", fmt(s.next_wake) + ' <span class="mute">if it suspended now</span>'],
+    ["Interval", esc(s.interval) + (s.aligned ? " (aligned to the clock)" : "")],
+    ["Runs as", esc(s.run_as)],
+  ].map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+  $("pending").innerHTML = s.pending.length
+    ? "<ul>" + s.pending.map(t => `<li>${esc(t.name)}${t.not_before ? ` <span class="mute">not before</span> ${fmt(t.not_before)}` : ""}</li>`).join("") + "</ul>"
+    : '<span class="mute">queue empty</span>';
+  $("results").innerHTML = s.results.map(r =>
+    `<tr><td>${r.started ? fmt(r.started) : ""}</td><td><b class="${cls[r.status] || ""}">${esc(r.status)}</b>`
+    + `${r.exit_code != null ? ` <span class="mute">exit ${r.exit_code}, ${r.duration_s}s</span>` : ""}<br>`
+    + `<a href="#" onclick="showLog('${esc(r.dir)}');return false">${esc(r.id)}</a></td></tr>`).join("")
+    || '<tr><td class="mute">none yet</td></tr>';
+  $("journal").textContent = s.journal.join("\n") || "(no journal access)";
+}
+
+async function load() {
+  try { render(await (await fetch("api/status")).json()); }
+  catch (e) { $("sub").innerHTML = '<b class="bad">unreachable</b> — asleep? It wakes at the next alarm.'; }
+}
+async function act(what) {
+  $("holdbtn").disabled = $("relbtn").disabled = true;
+  const r = await fetch("api/" + what, {method: "POST", headers: {"X-Sleepq": "1"}});
+  if (r.ok) render(await r.json()); else load();
+}
+async function showLog(dir) {
+  const el = $("log");
+  el.textContent = `── ${dir} ──\n` + await (await fetch("api/log/" + encodeURIComponent(dir))).text();
+  el.hidden = false; el.scrollIntoView({behavior: "smooth"});
+}
+load(); setInterval(load, 15000);
+</script>
+</body></html>
+"""
 
 
 def submit(args):
@@ -635,6 +821,8 @@ def main():
     sub.add_parser("status", help="show queue, alarm and what keeps the machine awake")
     sub.add_parser("hold", help="keep this machine awake until 'sleepq release'")
     sub.add_parser("release", help="undo 'sleepq hold'")
+    s = sub.add_parser("web", help="serve a status page with hold/release buttons (sleepq-web.service)")
+    s.add_argument("--listen", help="address:port (default: web_listen in the config)")
     s = sub.add_parser("submit", help="add a task to a queue clone and push it (run on any machine)")
     s.add_argument("script", nargs="?", help="script file, or - for stdin")
     s.add_argument("-c", "--command", help="queue a one-line shell command instead of a script")
@@ -663,12 +851,13 @@ def main():
         q.arm()
     elif args.cmd == "status":
         q.status()
+    elif args.cmd == "web":
+        q.web(args.listen or q.cfg["web_listen"])
     elif args.cmd == "hold":
-        q.state.mkdir(parents=True, exist_ok=True)
-        (q.state / "hold").touch()
+        q.set_hold(True)
         print("holding: this machine will not suspend until 'sleepq release'")
     elif args.cmd == "release":
-        (q.state / "hold").unlink(missing_ok=True)
+        q.set_hold(False)
         print("released")
 
 

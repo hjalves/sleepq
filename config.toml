@@ -33,3 +33,7 @@ block_on_sessions = "active"
 
 # Log what would happen instead of setting the alarm and suspending.
 dry_run = true   # set to false once a dry run looks right
+
+# `sleepq web` (sleepq-web.service): status page with hold/release buttons. No login: anyone who
+# can reach it can see the queue and keep the machine awake. Use "127.0.0.1:8377" to keep it local.
+web_listen = "0.0.0.0:8377"

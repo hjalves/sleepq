@@ -28,7 +28,7 @@ Because the machine can't be reached while asleep, the queue lives in a git remo
 6. The shipped config has `dry_run = true`. Run `sudo systemctl enable --now sleepq` and
    `journalctl -u sleepq -f`, and once it looks right set `dry_run = false` and restart the service.
 
-Files: `/usr/bin/sleepq`, `sleepq.service`, `/usr/lib/systemd/system-sleep/sleepq`,
+Files: `/usr/bin/sleepq`, `sleepq.service`, `sleepq-web.service`, `/usr/lib/systemd/system-sleep/sleepq`,
 `/etc/sleepq/config.toml` (kept across upgrades), and `/var/lib/sleepq/` for the clone and logs.
 
 ## Submitting tasks
@@ -92,9 +92,17 @@ Results land in `results/<task-id>/`: the script, `output.log` (tail, capped by 
 
 `sudo sleepq status` shows pending tasks, the current alarm and what's keeping the machine awake.
 
+## Web page
+
+`sudo systemctl enable --now sleepq-web` serves a status page on port 8377 (`web_listen` in the config):
+daemon state, alarm and next wake, what keeps the machine awake, pending tasks, recent results with
+their output, the daemon log, and **Hold** / **Release** buttons (the same as `sleepq hold` / `release`).
+It has no login, so anyone who can reach the port can see the queue and keep the machine awake.
+It's only reachable while the machine is awake; to keep it up remotely, commit a `HOLD` file instead.
+
 ## Uninstall
 
 ```bash
-sudo pacman -R sleepq          # also disables the service
+sudo pacman -R sleepq          # also disables the services
 sudo rm -r /var/lib/sleepq      # queue clone and logs, if you don't want them
 ```

@@ -8,7 +8,7 @@ MSG
 }
 
 pre_remove() {
-  systemctl disable --now sleepq.service >/dev/null 2>&1 || true
+  systemctl disable --now sleepq.service sleepq-web.service >/dev/null 2>&1 || true
 }
 
 post_remove() {
