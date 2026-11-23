@@ -68,6 +68,16 @@ Results land in `results/<task-id>/`: the script, `output.log` (tail, capped by 
   - a `HOLD` file committed to the repo root (remote switch)
 
   While held it keeps checking the queue every `awake_poll`.
+- **Idle TTY detection:** on some systems, this logind configuration may be needed for idle TTY
+  sessions to be detected as idle:
+  ```bash
+  sudo mkdir -p /etc/systemd/logind.conf.d
+  sudo tee /etc/systemd/logind.conf.d/idle.conf <<'EOF'
+  [Login]
+  IdleAction=ignore
+  IdleActionSec=5min
+  EOF
+  ```
 - **Any suspend sets the alarm:** the sleep hook arms the RTC before *every* suspend, including lid,
   menu and idle suspends, so the machine always comes back for the next check.
 - **Power loss / crash:** a task that was running is retried; after `max_attempts` interruptions it's
