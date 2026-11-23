@@ -573,6 +573,7 @@ class SleepQ:
         }
 
     def web(self, listen):
+        import socketserver
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         q = self
 
@@ -615,7 +616,12 @@ class SleepQ:
                 pass
 
         host, _, port = listen.rpartition(":")
-        server = ThreadingHTTPServer((host.strip("[]") or "0.0.0.0", int(port)), Handler)
+        class Server(ThreadingHTTPServer):
+            def server_bind(self):  # skip HTTPServer's reverse DNS lookup (getfqdn), slow on some LANs
+                socketserver.TCPServer.server_bind(self)
+                self.server_name, self.server_port = q.host, self.server_address[1]
+
+        server = Server((host.strip("[]") or "0.0.0.0", int(port)), Handler)
         log(f"sleepq web listening on {listen}")
         server.serve_forever()
 
