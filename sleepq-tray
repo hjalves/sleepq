@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""sleepq-tray: system tray icon showing sleepq status, with a hold toggle.
+
+Polls the sleepq web API (sleepq-web.service) and never touches sleepq state directly,
+so it runs as the desktop user without root. Needs python-pystray; on Wayland the tray
+must support StatusNotifierItem (the Xfce panel's "Status Tray" plugin does).
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import threading
+import urllib.request
+import webbrowser
+
+os.environ.setdefault("PYSTRAY_BACKEND", "appindicator")  # the only pystray backend that works on Wayland
+
+import pystray  # noqa: E402
+from PIL import Image, ImageDraw  # noqa: E402
+
+COLORS = {
+    "unreachable": (128, 128, 128),  # web API down (or this is a stale reading)
+    "stopped": (204, 51, 51),        # sleepq.service not active
+    "held": (230, 150, 20),          # local or remote hold
+    "awake": (60, 130, 220),         # sessions or other reasons keep it awake
+    "idle": (60, 170, 90),           # nothing keeps it awake: it will suspend
+}
+LABELS = {
+    "unreachable": "sleepq: web API unreachable",
+    "stopped": "sleepq: daemon {daemon}",
+    "held": "sleepq: on hold",
+    "awake": "sleepq: kept awake",
+    "idle": "sleepq: will suspend when idle",
+}
+
+
+def make_icon(state, failed):
+    """Crescent moon in the state colour, with a red dot if the last task failed."""
+    size = 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse((4, 4, 60, 60), fill=COLORS[state] + (255,))
+    d.ellipse((20, -2, 70, 48), fill=(0, 0, 0, 0))  # cut out the crescent
+    if failed:
+        d.ellipse((38, 38, 62, 62), fill=(220, 40, 40, 255), outline=(255, 255, 255, 255), width=3)
+    return img
+
+
+def hhmm(iso):
+    try:
+        t = dt.datetime.fromisoformat(iso).astimezone()
+    except (TypeError, ValueError):
+        return iso or "?"
+    today = dt.datetime.now().astimezone().date()
+    return f"{t:%H:%M}" if t.date() == today else f"{t:%a %H:%M}"
+
+
+class Tray:
+    def __init__(self, url, interval):
+        self.url = url.rstrip("/")
+        self.interval = interval
+        self.status = None
+        self.error = None
+        self.stop = threading.Event()
+        self.icon = pystray.Icon("sleepq", make_icon("unreachable", False), "sleepq", menu=self.menu())
+
+    # --- API -------------------------------------------------------------------------------
+    def fetch(self):
+        try:
+            with urllib.request.urlopen(self.url + "/api/status", timeout=10) as r:
+                self.status, self.error = json.load(r), None
+        except (OSError, ValueError) as e:
+            self.status, self.error = None, str(getattr(e, "reason", e))
+
+    def post(self, what):
+        req = urllib.request.Request(f"{self.url}/api/{what}", data=b"", method="POST",
+                                     headers={"X-Sleepq": "1"})
+        try:
+            urllib.request.urlopen(req, timeout=10).close()
+        except OSError as e:
+            self.icon.notify(f"{what} failed: {getattr(e, 'reason', e)}", "sleepq")
+        self.refresh()
+
+    # --- state -----------------------------------------------------------------------------
+    def state(self):
+        s = self.status
+        if s is None:
+            return "unreachable"
+        if s.get("daemon") != "active":
+            return "stopped"
+        if s.get("local_hold") or s.get("remote_hold"):
+            return "held"
+        return "awake" if s.get("stay_awake") else "idle"
+
+    def last_failed(self):
+        results = (self.status or {}).get("results") or []
+        return bool(results) and results[0].get("status") not in ("ok", "?")
+
+    def refresh(self):
+        self.fetch()
+        state = self.state()
+        self.icon.icon = make_icon(state, self.last_failed())
+        self.icon.title = self.lines()[0]
+        self.icon.update_menu()
+
+    def loop(self):
+        while not self.stop.is_set():
+            self.refresh()
+            self.stop.wait(self.interval)
+
+    # --- menu ------------------------------------------------------------------------------
+    def lines(self):
+        s = self.status
+        if s is None:
+            return [LABELS["unreachable"], f"{self.url}: {self.error}"]
+        out = [LABELS[self.state()].format(daemon=s.get("daemon", "?"))
+               + (" (dry run)" if s.get("dry_run") else "")]
+        out.append(f"Next wake: {hhmm(s.get('next_wake'))} (every {s.get('interval', '?')})")
+        out += [f"  awake: {r}" for r in s.get("stay_awake") or []]
+        pending = s.get("pending") or []
+        out.append(f"Pending tasks: {len(pending)}")
+        out += [f"  {t['name']}" for t in pending[:5]]
+        results = s.get("results") or []
+        if results:
+            r = results[0]
+            out.append(f"Last task: {r.get('id', '?')} — {r.get('status', '?')}"
+                       + (f" at {hhmm(r['finished'])}" if r.get("finished") else ""))
+        return out
+
+    def menu(self):
+        def info_items():
+            return [pystray.MenuItem(line, None, enabled=False) for line in self.lines()]
+
+        def held(_item):
+            return bool(self.status and self.status.get("local_hold"))
+
+        def toggle_hold(_icon, _item):
+            threading.Thread(target=self.post, args=("release" if held(None) else "hold",),
+                             daemon=True).start()
+
+        return pystray.Menu(
+            lambda: (
+                *info_items(),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Hold (stay awake)", toggle_hold, checked=held,
+                                 enabled=lambda _i: self.status is not None),
+                pystray.MenuItem("Open web UI", lambda: webbrowser.open(self.url + "/")),
+                pystray.MenuItem("Refresh", lambda: threading.Thread(target=self.refresh, daemon=True).start()),
+                pystray.MenuItem("Quit", self.quit),
+            )
+        )
+
+    def quit(self):
+        self.stop.set()
+        self.icon.stop()
+
+    def run(self):
+        def setup(icon):
+            icon.visible = True
+            threading.Thread(target=self.loop, daemon=True).start()
+        self.icon.run(setup)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--url", default="http://localhost:8377", help="sleepq web base URL (default: %(default)s)")
+    p.add_argument("--interval", type=float, default=15, help="poll interval in seconds (default: %(default)s)")
+    a = p.parse_args()
+    Tray(a.url, a.interval).run()
+
+
+if __name__ == "__main__":
+    main()

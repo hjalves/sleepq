@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=sleepq tray
+Comment=System tray icon showing sleepq status
+Exec=sleepq-tray
+Icon=weather-clear-night
+Terminal=false
+Categories=System;Monitor;
+X-GNOME-Autostart-enabled=true

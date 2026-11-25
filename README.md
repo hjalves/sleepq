@@ -100,6 +100,18 @@ their output, the daemon log, and **Hold** / **Release** buttons (the same as `s
 It has no login, so anyone who can reach the port can see the queue and keep the machine awake.
 It's only reachable while the machine is awake; to keep it up remotely, commit a `HOLD` file instead.
 
+## Tray icon
+
+`sleepq-tray` puts a crescent moon in the desktop's system tray. It needs the optional
+`python-pystray` package and polls the web API (`--url`, default `http://localhost:8377`), so
+`sleepq-web.service` must be running. It is started by `/etc/xdg/autostart/sleepq-tray.desktop`.
+On Wayland it registers as a StatusNotifierItem (the Xfce panel's Status Tray plugin shows it).
+
+Colour: green = will suspend when idle, blue = kept awake by sessions, amber = on hold,
+red = `sleepq.service` not active, grey = web API unreachable. A red dot means the last task failed.
+The menu shows the next wake, why it is staying awake, pending tasks and the last result, plus a
+**Hold** toggle (the same local hold as `sleepq hold`/`release`) and a link to the web page.
+
 ## Uninstall
 
 ```bash
