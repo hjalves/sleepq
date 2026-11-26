@@ -1,0 +1,17 @@
+[project]
+name = "sleepq-remote"
+version = "0.1.0"
+description = "Web front-end for a sleepq queue repo: hold/release the machine and queue commands"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+[project.scripts]
+sleepq-remote = "sleepq_remote.__main__:main"
+
+[build-system]
+requires = ["uv_build>=0.9,<1"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""

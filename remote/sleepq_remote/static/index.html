@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sleepq remote</title>
+<style>
+  :root { color-scheme: light dark; --ok:#2e9e5b; --bad:#d0453a; --warn:#d99a1e; --mute:#888;
+          --card: color-mix(in srgb, currentColor 6%, transparent); --accent:#3b6fd8; }
+  * { box-sizing: border-box; }
+  body { font: 15px/1.45 system-ui, sans-serif; max-width: 46rem; margin: 0 auto; padding: 1rem; }
+  h1 { font-size: 1.3rem; margin: 0; } h2 { font-size: 1rem; margin: 1.5rem 0 .5rem; }
+  .mute { color: var(--mute); } .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+  .card { background: var(--card); border-radius: .5rem; padding: .8rem; margin: .5rem 0; }
+  .row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
+  .grow { flex: 1; min-width: 12rem; }
+  button { font: inherit; padding: .45rem 1rem; border-radius: .4rem; border: 1px solid var(--mute);
+           background: transparent; color: inherit; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.small { padding: .1rem .55rem; font-size: .85rem; }
+  button:disabled { opacity: .5; cursor: default; }
+  textarea, input { font: inherit; width: 100%; padding: .45rem; border-radius: .4rem;
+                    border: 1px solid var(--mute); background: transparent; color: inherit; }
+  textarea { font-family: ui-monospace, monospace; font-size: 13px; min-height: 5.5rem; resize: vertical; }
+  label { display: block; font-size: .85rem; color: var(--mute); margin: .5rem 0 .15rem; }
+  .fields { display: grid; grid-template-columns: 2fr 2fr 1fr; gap: 0 .6rem; }
+  @media (max-width: 34rem) { .fields { grid-template-columns: 1fr; } }
+  pre { font-size: 12px; overflow-x: auto; padding: .6rem; border-radius: .4rem; background: var(--card);
+        white-space: pre-wrap; margin: .4rem 0 0; }
+  table { border-collapse: collapse; width: 100%; } td { padding: .25rem .5rem .25rem 0; vertical-align: top; }
+  a { color: var(--accent); } code { font-size: .9em; }
+  #toast { position: fixed; left: 50%; bottom: 1rem; transform: translateX(-50%); padding: .5rem 1rem;
+           border-radius: .4rem; background: #222; color: #fff; display: none; max-width: 90vw; }
+  #toast.err { background: var(--bad); }
+</style></head>
+<body>
+<h1>sleepq remote</h1>
+<div class="mute" id="sub">loading…</div>
+
+<div class="card" id="machine"></div>
+
+<div class="card row">
+  <div class="grow" id="holdtext"></div>
+  <div class="row" style="flex-wrap:nowrap">
+    <button id="holdbtn" class="primary" onclick="hold(true)">Hold</button>
+    <button id="relbtn" onclick="hold(false)">Release</button>
+  </div>
+</div>
+
+<h2>Queue a command</h2>
+<div class="card">
+  <textarea id="cmd" placeholder="Shell commands, run with bash as the sleepq user (set -euo pipefail is added)"></textarea>
+  <div class="fields">
+    <div><label for="name">Name</label><input id="name" placeholder="cmd"></div>
+    <div><label for="nb">Not before (optional)</label><input id="nb" type="datetime-local"></div>
+    <div><label for="to">Timeout</label><input id="to" placeholder="default"></div>
+  </div>
+  <div class="row" style="margin-top:.7rem">
+    <span class="grow mute" style="font-size:.85rem">Runs at the next wake, or within a few minutes if the machine is awake.</span>
+    <button class="primary" id="submitbtn" onclick="submitTask()">Queue</button>
+  </div>
+</div>
+
+<h2>Pending</h2><div id="pending"></div>
+<h2>Recent results</h2><table id="results"></table>
+<div id="log" hidden></div>
+<p class="mute" id="foot"></p>
+<div id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+function when(t) {
+  if (t == null || t === "unknown") return t ?? "never";
+  const d = typeof t === "number" ? new Date(t * 1000) : new Date(t);
+  const mins = Math.round((d - Date.now()) / 60000), a = Math.abs(mins);
+  const span = a < 90 ? `${a} min` : a < 2880 ? `${Math.round(a / 60)} h` : `${Math.round(a / 1440)} days`;
+  const rel = mins === 0 ? "now" : mins > 0 ? `in ${span}` : `${span} ago`;
+  return `${d.toLocaleString([], {dateStyle: "short", timeStyle: "short"})} <span class="mute">(${rel})</span>`;
+}
+const cls = {ok: "ok", failed: "bad", timeout: "bad", interrupted: "warn"};
+let busy = false;
+
+function toast(msg, err) {
+  const t = $("toast"); t.textContent = msg; t.className = err ? "err" : ""; t.style.display = "block";
+  clearTimeout(toast.h); toast.h = setTimeout(() => t.style.display = "none", err ? 8000 : 3000);
+}
+
+function renderMachine(live) {
+  if (!live.configured) { $("machine").innerHTML = '<span class="mute">No live status configured.</span>'; return; }
+  const s = live.status;
+  const host = esc(s?.host || "machine");
+  if (live.awake && s) {
+    const why = s.stay_awake.length ? "kept awake by " + s.stay_awake.map(esc).join("; ") : "nothing keeps it awake";
+    $("machine").innerHTML = `<b class="ok">${host} is awake</b> · daemon ${esc(s.daemon)}${s.dry_run ? " · dry run" : ""}`
+      + `<div class="mute">${why}</div><div>Next wake if it suspends now: ${when(s.next_wake)}</div>`;
+  } else {
+    $("machine").innerHTML = `<b class="mute">${host} is asleep or unreachable</b>`
+      + (s ? `<div>Last seen awake ${when(live.last_ok_at)}; it expected to wake next at ${when(s.next_wake)}`
+             + ` <span class="mute">(every ${esc(s.interval)}${s.aligned ? ", on the clock" : ""})</span></div>`
+           : `<div class="mute">Not seen awake since this page started.</div>`);
+  }
+}
+
+function render(s) {
+  $("sub").innerHTML = `queue repo <code>${esc(s.repo)}</code>`;
+  renderMachine(s.live);
+  if (s.hold) {
+    const c = s.hold_commit;
+    $("holdtext").innerHTML = `<b class="warn">HOLD is set</b> — the machine stays awake once it wakes`
+      + (c ? `<div class="mute">${esc(c.subject)}, ${when(c.when)}</div>` : "");
+  } else {
+    $("holdtext").innerHTML = `No HOLD — it suspends when idle`
+      + (s.hold_commit ? `<div class="mute">${esc(s.hold_commit.subject)}, ${when(s.hold_commit.when)}</div>` : "");
+  }
+  $("holdbtn").disabled = busy || s.hold; $("relbtn").disabled = busy || !s.hold;
+
+  $("pending").innerHTML = s.pending.length ? s.pending.map(t => {
+    const h = t.headers, meta = [h["not-before"] ? "not before " + when(h["not-before"]) : "", h.timeout ? "timeout " + esc(h.timeout) : ""].filter(Boolean).join(" · ");
+    return `<div class="card"><div class="row"><b class="grow">${esc(t.name)}</b>`
+      + `<button class="small" onclick="cancelTask('${esc(t.name)}')" ${busy ? "disabled" : ""}>Cancel</button></div>`
+      + (meta ? `<div class="mute">${meta}</div>` : "")
+      + `<details><summary class="mute">script</summary><pre>${esc(t.script)}</pre></details></div>`;
+  }).join("") : '<div class="mute">nothing queued</div>';
+
+  $("results").innerHTML = s.results.map(r =>
+    `<tr><td style="white-space:nowrap">${r.started ? when(r.started) : ""}</td>`
+    + `<td><b class="${cls[r.status] || ""}">${esc(r.status)}</b>`
+    + (r.exit_code != null ? ` <span class="mute">exit ${r.exit_code}, ${r.duration_s}s</span>` : "")
+    + `<br><a href="#" onclick="showLog('${esc(r.dir)}');return false">${esc(r.id)}</a></td></tr>`).join("")
+    || '<tr><td class="mute">none yet</td></tr>';
+
+  $("foot").innerHTML = (s.fetch_error ? `<b class="bad">git: ${esc(s.fetch_error)}</b><br>` : "")
+    + `Queue synced ${when(s.fetched_at)} · <a href="#" onclick="post('refresh', {});return false">refresh now</a>`;
+}
+
+async function load() {
+  if (busy) return;
+  try { render(await (await fetch("api/state")).json()); }
+  catch (e) { $("sub").innerHTML = '<b class="bad">cannot reach sleepq-remote</b>'; }
+}
+
+async function post(what, body) {
+  busy = true; document.querySelectorAll("button").forEach(b => b.disabled = true);
+  try {
+    const r = await fetch("api/" + what, {method: "POST", headers: {"X-Sleepq": "1", "Content-Type": "application/json"},
+                                           body: JSON.stringify(body)});
+    const j = await r.json();
+    busy = false;
+    if (!r.ok) { toast(j.error || r.statusText, true); load(); return false; }
+    render(j); if (j.message && what !== "refresh") toast(j.message);
+    return true;
+  } catch (e) { busy = false; toast(String(e), true); load(); return false; }
+  finally { busy = false; $("submitbtn").disabled = false; }
+}
+
+const hold = on => post("hold", {on});
+function cancelTask(name) { if (confirm(`Remove ${name} from the queue?`)) post("cancel", {name}); }
+async function submitTask() {
+  const nb = $("nb").value;
+  const ok = await post("submit", {command: $("cmd").value, name: $("name").value, timeout: $("to").value,
+                                   not_before: nb ? new Date(nb).toISOString() : ""});
+  if (ok) { $("cmd").value = ""; $("name").value = ""; $("nb").value = ""; $("to").value = ""; }
+}
+async function showLog(dir) {
+  const r = await (await fetch("api/result/" + encodeURIComponent(dir))).json();
+  const el = $("log");
+  el.innerHTML = `<h2>${esc(dir)}</h2><details><summary class="mute">script</summary><pre>${esc(r.script)}</pre></details>`
+    + `<pre>${esc(r.output)}</pre>`;
+  el.hidden = false; el.scrollIntoView({behavior: "smooth"});
+}
+load(); setInterval(load, 15000);
+</script>
+</body></html>

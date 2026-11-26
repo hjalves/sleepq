@@ -1,0 +1,47 @@
+# Example unit for sleepq-remote. Copy it, replace the placeholders, and pass it to deploy/install.sh:
+#   APP     /home/USER/apps/sleepq-remote   (where install.sh puts the app; default ~/apps/sleepq-remote)
+#   USER    the account that owns APP (its group may write data/)
+#   REPO    your queue repo, e.g. git@github.com:you/sleepq-queue.git
+#   LIVE    the sleeping machine's `sleepq web` status URL (optional), e.g. http://sleepq-host:8377/api/status
+# The deploy key (write access to REPO only) lives in /etc/sleepq-remote/deploy_key, root-only.
+[Unit]
+Description=sleepq-remote: web front-end for a sleepq queue repo (hold/release, queue commands)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/USER/apps/sleepq-remote/.venv/bin/python -m sleepq_remote
+WorkingDirectory=/home/USER/apps/sleepq-remote
+Environment=PYTHONUNBUFFERED=1
+Environment=SLEEPQ_REMOTE_REPO=git@github.com:you/sleepq-queue.git
+Environment=SLEEPQ_REMOTE_DIR=/home/USER/apps/sleepq-remote/data/repo
+Environment=SLEEPQ_REMOTE_LIVE=http://sleepq-host:8377/api/status
+Environment=SLEEPQ_REMOTE_LISTEN=0.0.0.0:8378
+Environment=HOME=/home/USER/apps/sleepq-remote/data
+LoadCredential=deploy_key:/etc/sleepq-remote/deploy_key
+SupplementaryGroups=USER
+UMask=0002
+Restart=on-failure
+RestartSec=5
+
+DynamicUser=yes
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindReadOnlyPaths=/home/USER/apps/sleepq-remote
+BindPaths=/home/USER/apps/sleepq-remote/data
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

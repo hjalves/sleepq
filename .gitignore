@@ -1,3 +1,7 @@
 src/
 pkg/
 *.pkg.tar.*
+remote/.venv/
+remote/.python/
+remote/data/
+__pycache__/

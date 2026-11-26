@@ -112,6 +112,12 @@ red = `sleepq.service` not active, grey = web API unreachable. A red dot means t
 The menu shows the next wake, why it is staying awake, pending tasks and the last result, plus a
 **Hold** toggle (the same local hold as `sleepq hold`/`release`) and a link to the web page.
 
+## Controlling it from another machine
+
+[`remote/`](remote/) is a separate web app for an always-on server. It commits `HOLD`, queues and
+cancels commands, and shows results through the queue repo, so it works while this machine sleeps.
+It isn't part of the package; see [remote/README.md](remote/README.md).
+
 ## Uninstall
 
 ```bash
